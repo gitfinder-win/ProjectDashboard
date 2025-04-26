@@ -6,21 +6,26 @@ from matplotlib.gridspec import GridSpec
 import os
 import datetime
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.widgets import Cursor
 from data_processor import DataProcessor
+import threading
+import time
+import platform
 
 # Set Chinese font
-plt.rcParams['font.sans-serif'] = ['SimHei']  # For displaying Chinese characters
-plt.rcParams['axes.unicode_minus'] = False    # Correctly display the minus sign
+# 设置更美观的中文字体和全局样式
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 使用更现代的中文字体
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['font.size'] = 10  # 统一基础字号
 
 class ProjectDashboard:
     def __init__(self, master):
         self.master = master
         self.master.title("项目看板")
         self.master.geometry("1280x720")
-        self.master.configure(bg="#000720")
+        self.master.configure(bg="#0a1a35")  # 使用更柔和的深蓝色背景
         
         # Data attributes
         self.data_processor = DataProcessor()
@@ -29,6 +34,20 @@ class ProjectDashboard:
         self.temp_annotations = []  # 存储临时悬停注释
         self.fixed_annotations = []  # 存储固定点击注释
         self.dept_bars = {}  # 初始化部门柱状图字典
+        self.highlight_active = False  # 自动高亮状态
+        self.highlight_index = 0  # 当前高亮部门索引
+        self.highlight_timer = None  # 高亮定时器
+        self.highlight_duration = 5  # 高亮显示时长(秒)
+        
+        # 防止休眠相关变量
+        self.keep_awake_active = False  # 保持显示状态
+        self.keep_awake_thread = None   # 保持显示线程
+        self.scheduled_display = False  # 定时显示状态
+        self.schedule_start_hour = 8    # 默认开始时间 8:00
+        self.schedule_start_minute = 0
+        self.schedule_end_hour = 18     # 默认结束时间 18:00
+        self.schedule_end_minute = 0
+        self.schedule_check_timer = None  # 检查时间段的定时器
         
         # Create UI
         self.create_widgets()
@@ -40,7 +59,7 @@ class ProjectDashboard:
         
         # Load Excel button
         self.load_btn = tk.Button(self.control_frame, text="加载Excel数据", command=self.load_excel_file,
-                                 bg="#FF9F45", fg="white", font=("SimHei", 12))
+                                 bg="#4a89dc", fg="white", font=("Microsoft YaHei", 12, "bold"))
         self.load_btn.pack(side=tk.LEFT, padx=5)
         
         # Year selection
@@ -61,12 +80,44 @@ class ProjectDashboard:
                                      bg="#4a69bd", fg="white", font=("SimHei", 12))
         self.reset_zoom_btn.pack(side=tk.LEFT, padx=5)
         
+        # 高亮持续时间设置
+        self.duration_label = tk.Label(self.control_frame, text="高亮时长(秒):", bg="#000720", fg="white", font=("SimHei", 12))
+        self.duration_label.pack(side=tk.LEFT, padx=5)
+        
+        self.duration_var = tk.StringVar(value=str(self.highlight_duration))
+        self.duration_entry = tk.Entry(self.control_frame, textvariable=self.duration_var, width=3, font=("SimHei", 12))
+        self.duration_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Auto highlight toggle button
+        self.highlight_btn = tk.Button(self.control_frame, text="开始高亮", command=self.toggle_highlight,
+                                     bg="#37b24d", fg="white", font=("SimHei", 12))
+        self.highlight_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 添加分隔线
+        separator = tk.Frame(self.control_frame, height=30, width=2, bg="gray")
+        separator.pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        
+        # 保持常显按钮
+        self.keep_awake_btn = tk.Button(self.control_frame, text="保持常显", command=self.toggle_keep_awake,
+                                     bg="#37b24d", fg="white", font=("SimHei", 12))
+        self.keep_awake_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 定时显示按钮
+        self.schedule_btn = tk.Button(self.control_frame, text="定时显示", command=self.toggle_scheduled_display,
+                                   bg="#37b24d", fg="white", font=("SimHei", 12))
+        self.schedule_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 设置时间段按钮
+        self.time_settings_btn = tk.Button(self.control_frame, text="设置时间段", command=self.show_schedule_settings,
+                                        bg="#4a89dc", fg="white", font=("SimHei", 12))
+        self.time_settings_btn.pack(side=tk.LEFT, padx=5)
+        
         # Canvas for showing the dashboard
         self.canvas_frame = tk.Frame(self.master, bg="#000720")
         self.canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Create figure for plotting
-        self.fig = plt.Figure(figsize=(12, 8), dpi=100, facecolor="#000720")
+        self.fig = plt.Figure(figsize=(12, 8), dpi=100, facecolor="#0a1a35")
         self.canvas = FigureCanvasTkAgg(self.fig, self.canvas_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
@@ -157,7 +208,7 @@ class ProjectDashboard:
     
     def create_monthly_completion_chart(self, ax):
         """Create a chart showing monthly completion rates for 4 departments"""
-        ax.set_title("1-12月部门任务计划完成率趋势图", color="white", fontsize=10, pad=35)  # 增加 pad 值
+        ax.set_title("1-12月部门任务计划完成率趋势图", color="white", fontsize=12, pad=35)  # 增加 pad 值
         ax.set_facecolor("#101450")
         
         # Get monthly completion rates for 4 departments
@@ -177,8 +228,15 @@ class ProjectDashboard:
         ax.grid(True, linestyle="--", alpha=0.3)
         ax.set_xticks(month_numbers)
         ax.set_xticklabels([str(num) for num in month_numbers])
-        ax.set_xlabel("月份", color="white", fontsize=9)
-        ax.set_ylabel("任务计划完成率 (%)", color="white", fontsize=9)
+        ax.set_xlabel("月份", color="white", fontsize=11)
+        ax.set_ylabel("任务计划完成率 (%)", color="white", fontsize=11)
+        
+        # 添加80%水位线（不添加label和picker属性）
+        ax.axhline(y=80, color='red', linestyle='--', linewidth=2, alpha=0.6, zorder=1)
+        
+        # 添加填充区域来区分80%以上和以下的区域
+        ax.fill_between(month_numbers, 80, 100, color='green', alpha=0.1, zorder=0)
+        ax.fill_between(month_numbers, 0, 80, color='red', alpha=0.1, zorder=0)
         
         # 存储部门平均完成率，用于图例
         dept_avg_rates = {}
@@ -389,6 +447,10 @@ class ProjectDashboard:
     
     def on_hover(self, event):
         """Handle hover event to show data on hover"""
+        # 如果自动高亮功能正在运行，忽略鼠标悬停事件
+        if self.highlight_active:
+            return
+            
         if event.inaxes is None:
             # 鼠标不在任何坐标轴内
             self._reset_all_line_styles()  # 重置所有线条样式
@@ -424,10 +486,16 @@ class ProjectDashboard:
                     rate = ydata[closest_idx]
                     
                     # 创建临时注释，添加zorder确保显示在最上层
+                    # 为12月份特殊处理文本位置，避免标签超出图表
+                    if month == 12:
+                        xytext = (-60, 10)  # 向左偏移文本位置
+                    else:
+                        xytext = (10, 10)
+                        
                     annotation = self.fig.axes[0].annotate(
                         f"{dept_name}: {month}月 {rate:.1f}%",
                         xy=(xdata[closest_idx], ydata[closest_idx]),
-                        xytext=(10, 10),
+                        xytext=xytext,
                         textcoords="offset points",
                         bbox=dict(boxstyle="round,pad=0.3", fc="yellow", ec="b", alpha=0.8),
                         color='black',
@@ -475,45 +543,13 @@ class ProjectDashboard:
         
         # 重绘图形
         self.fig.canvas.draw_idle()
-    def _reset_all_line_styles(self):
-        """重置所有趋势线的样式"""
-        if not hasattr(self, 'fig') or not self.fig.axes:
-            return
-            
-        for line in self.fig.axes[0].get_lines():
-            if hasattr(line, 'original_color'):
-                line.set_color(line.original_color)
-                line.set_linewidth(line.original_linewidth)
-            elif hasattr(line, 'dept_name'):
-                dept_idx = list(self.data_processor.departments).index(line.dept_name) \
-                    if line.dept_name in self.data_processor.departments else 0
-                line.set_color(['#3a7ca5', '#d63031', '#00b894', '#fdcb6e'][dept_idx % 4])
-  
-    def _reset_all_bar_highlights(self):
-        """重置所有柱状图的高亮状态"""
-        if not hasattr(self, 'dept_bars'):
-            return
-            
-        # 恢复所有柱状图的原始透明度
-        for dept_bars in self.dept_bars.values():
-            for bar in dept_bars:
-                if hasattr(bar, 'is_highlighted') and bar.is_highlighted:
-                    bar.set_alpha(1.0)  # 恢复原始透明度
-                    bar.is_highlighted = False
-
-    def _highlight_department_bars(self, dept_name):
-        """高亮显示指定部门的所有柱状图"""
-        # 降低所有柱状图的透明度
-        for d_name, bars in self.dept_bars.items():
-            for bar in bars:
-                if d_name != dept_name:
-                    bar.set_alpha(0.3)  # 降低非目标部门的透明度
-                else:
-                    bar.set_alpha(1.0)  # 确保目标部门完全不透明
-                    bar.is_highlighted = True  # 标记为高亮状态
         
     def on_click(self, event):
         """Handle click event to fix annotations"""
+        # 如果自动高亮功能正在运行，忽略鼠标点击事件
+        if self.highlight_active:
+            return
+            
         if event.inaxes is None:
             # 点击在图表外部，重置所有效果
             self._reset_all_bar_highlights()
@@ -556,11 +592,12 @@ class ProjectDashboard:
                     xpos, ypos = event.xdata, event.ydata
                     distances = [(abs(x - xpos), i) for i, x in enumerate(xdata)]
                     closest_idx = min(distances, key=lambda x: x[0])[1]
+                    month = int(xdata[closest_idx])
                     
                     # 检查是否已经有固定注释
                     for annotation in self.fixed_annotations:
                         if hasattr(annotation, 'dept_name') and annotation.dept_name == dept_name and \
-                           hasattr(annotation, 'month') and annotation.month == int(xdata[closest_idx]):
+                           hasattr(annotation, 'month') and annotation.month == month:
                             # 如果已经有相同的固定注释，则移除它
                             annotation.remove()
                             self.fixed_annotations.remove(annotation)
@@ -568,17 +605,26 @@ class ProjectDashboard:
                             return
                     
                     # 创建固定注释，添加zorder确保显示在最上层
-                    month = int(xdata[closest_idx])
                     rate = ydata[closest_idx]
+                    
+                    # 为12月份特殊处理文本位置，避免标签超出图表
+                    if month == 12:
+                        xytext = (-60, 10)  # 向左偏移文本位置
+                        arrow_props = dict(arrowstyle="-", color="yellow", alpha=0.8, connectionstyle="arc3,rad=-0.2")
+                    else:
+                        xytext = (10, 10)
+                        arrow_props = dict(arrowstyle="-", color="yellow", alpha=0.8)
+                    
                     annotation = self.fig.axes[0].annotate(
                         f"{dept_name}: {month}月 {rate:.1f}%",
                         xy=(xdata[closest_idx], ydata[closest_idx]),
-                        xytext=(10, 10),
+                        xytext=xytext,
                         textcoords="offset points",
                         bbox=dict(boxstyle="round,pad=0.3", fc="yellow", ec="b", alpha=0.8),
                         color='black',
                         fontsize=9,
-                        zorder=1000  # 确保显示在最上层
+                        zorder=1000,  # 确保显示在最上层
+                        arrowprops=arrow_props
                     )
                     # 添加属性以便后续识别
                     annotation.dept_name = dept_name
@@ -664,10 +710,493 @@ class ProjectDashboard:
             
         self.canvas.draw()
         self.status_var.set("已重置缩放")
+        
+    def toggle_highlight(self):
+        """Toggle automatic department highlighting"""
+        self.highlight_active = not self.highlight_active
+        
+        if self.highlight_active:
+            self.highlight_btn.config(text="停止高亮", bg="#e03131")
+            self.start_highlight_cycle()
+        else:
+            self.highlight_btn.config(text="开始高亮", bg="#37b24d")
+            self.stop_highlight_cycle()
+            self.reset_highlight()
+    
+    def start_highlight_cycle(self):
+        """Start cycling through departments with highlighting"""
+        if not hasattr(self.data_processor, 'departments') or not self.data_processor.departments:
+            return
+            
+        self.highlight_index = 0
+        self.highlight_next_department()
+    
+    def highlight_next_department(self):
+        """Highlight the next department in sequence"""
+        if not self.highlight_active:
+            return
+            
+        departments = self.data_processor.departments
+        if not departments:
+            return
+            
+        # Reset previous highlight
+        self.reset_highlight()
+        
+        # Get current department
+        dept = departments[self.highlight_index]
+        
+        # Highlight department in both charts
+        self.highlight_department(dept)
+        
+        # Update index for next department
+        self.highlight_index = (self.highlight_index + 1) % len(departments)
+        
+        # Get current duration setting
+        try:
+            duration = int(self.duration_var.get())
+            if duration < 1:  # 确保至少为1秒
+                duration = 1
+            self.highlight_duration = duration
+        except ValueError:
+            # 如果输入无效，使用默认值
+            duration = self.highlight_duration
+        
+        # Schedule next highlight with updated duration (convert to milliseconds)
+        self.highlight_timer = self.master.after(duration * 1000, self.highlight_next_department)
+    
+    def stop_highlight_cycle(self):
+        """Stop the automatic highlighting cycle"""
+        if self.highlight_timer:
+            self.master.after_cancel(self.highlight_timer)
+            self.highlight_timer = None
+    
+    def reset_highlight(self):
+        """Reset all highlights to default appearance"""
+        for ax in self.fig.axes:
+            for line in ax.lines:
+                if hasattr(line, 'default_color'):
+                    line.set_color(line.default_color)
+                    line.set_linewidth(1.5)
+                    
+            for collection in ax.collections:
+                if hasattr(collection, 'default_color'):
+                    collection.set_color(collection.default_color)
+                    collection.set_alpha(0.7)
+        
+        self.canvas.draw()
+    
+    def highlight_department(self, dept_name):
+        """Highlight a specific department in all charts and show value labels"""
+        # 移除所有非固定注释
+        self._remove_non_fixed_annotations()
+        
+        # 重置所有线条样式
+        self._reset_all_line_styles()
+        
+        # 重置所有柱状图高亮
+        self._reset_all_bar_highlights()
+        
+        # 临时存储需要添加的注释
+        temp_annotations = []
+        
+        # 1. 处理趋势图中的线条
+        if len(self.fig.axes) > 0:
+            ax0 = self.fig.axes[0]
+            trend_annotations = []  # 保存趋势图的注释以便后续调整位置
+            
+            for line in ax0.get_lines():
+                if hasattr(line, 'dept_name') and line.dept_name == dept_name:
+                    # 高亮线条
+                    line.set_linewidth(3.0)
+                    line.set_color('yellow')
+                    
+                    # 获取数据用于注释
+                    xdata, ydata = line.get_data()
+                    
+                    # 查找最新月份（最大的月份值）
+                    valid_months = [int(x) for x, y in zip(xdata, ydata) if not np.isnan(y) and y > 0]
+                    latest_month = max(valid_months) if valid_months else 0
+                    
+                    # 为每个有效数据点添加注释
+                    for i, (x, y) in enumerate(zip(xdata, ydata)):
+                        if not np.isnan(y) and y > 0:  # 只显示有效且大于0的值
+                            month = int(x)
+                            # 创建注释但暂不添加
+                            # 只有最新月份显示完整部门名称，其它月份只显示数值
+                            if month == latest_month:
+                                text = f"{dept_name}: {month}月 {y:.1f}%"
+                            else:
+                                text = f"{month}月: {y:.1f}%"
+                                
+                            annotation = {
+                                'x': x,
+                                'y': y,
+                                'text': text,
+                                'month': month
+                            }
+                            trend_annotations.append(annotation)
+            
+            # 按月份排序注释，以便更好地调整布局
+            trend_annotations.sort(key=lambda a: a['month'])
+            
+            # 调整注释位置以避免重叠 - 避免重复标签
+            if trend_annotations:
+                # 将注释分组为高值和低值
+                high_values = [a for a in trend_annotations if a['y'] > 60]
+                low_values = [a for a in trend_annotations if a['y'] <= 60]
+                
+                # 函数：创建交错的注释
+                def create_staggered_annotations(annotations, base_y_offset, step, direction=1):
+                    # 每个月份只保留一个注释，避免重复
+                    unique_months = {}
+                    for anno in annotations:
+                        month = anno['month']
+                        # 如果月份已存在，只保留值较大的那个
+                        if month in unique_months:
+                            if anno['y'] > unique_months[month]['y']:
+                                unique_months[month] = anno
+                        else:
+                            unique_months[month] = anno
+                    
+                    # 对唯一的月份注释排序并创建
+                    sorted_annos = sorted(unique_months.values(), key=lambda a: a['month'])
+                    for i, anno in enumerate(sorted_annos):
+                        month = anno['month']
+                        y_offset = base_y_offset + (i % 3) * step * direction
+                        
+                        # 为12月特殊处理位置，避免超出右边界
+                        if month == 12:
+                            x_offset = -60  # 向左偏移，避免超出右边界
+                            arrow_props = dict(arrowstyle="-", color="yellow", alpha=0.8, connectionstyle="arc3,rad=-0.2")
+                        else:
+                            x_offset = 10
+                            arrow_props = dict(arrowstyle="-", color="yellow", alpha=0.8)
+                        
+                        annotation = ax0.annotate(
+                            anno['text'],
+                            xy=(anno['x'], anno['y']),
+                            xytext=(x_offset, y_offset),
+                            textcoords="offset points",
+                            bbox=dict(boxstyle="round,pad=0.3", fc="yellow", ec="b", alpha=0.8),
+                            color='black',
+                            fontsize=9,
+                            zorder=1000,
+                            arrowprops=arrow_props
+                        )
+                        temp_annotations.append(annotation)
+                
+                # 处理高值和低值注释
+                create_staggered_annotations(high_values, 10, 20, 1)  # 高值向上交错
+                create_staggered_annotations(low_values, -25, 20, -1)  # 低值向下交错
+        
+        # 2. 处理柱状图
+        if len(self.fig.axes) > 1 and hasattr(self, 'dept_bars'):
+            ax1 = self.fig.axes[1]
+            
+            # 高亮部门的所有柱状图
+            self._highlight_department_bars(dept_name)
+            
+            # 查找最新月份
+            latest_month = 0
+            if dept_name in self.dept_bars:
+                valid_months = []
+                for bar in self.dept_bars[dept_name]:
+                    month_num = getattr(bar, 'month_num', 0)
+                    value = getattr(bar, 'value', 0)
+                    if value > 0:  # 只考虑有值的月份
+                        valid_months.append(month_num)
+                if valid_months:
+                    latest_month = max(valid_months)
+            
+            # 为部门的每个柱状图添加注释 (仅最近一个月)
+            if dept_name in self.dept_bars and latest_month > 0:
+                # 按月份分组收集注释数据
+                bar_annotations = []
+                
+                for bar in self.dept_bars[dept_name]:
+                    # 获取数据用于注释
+                    month_num = getattr(bar, 'month_num', 0)
+                    metric_name = getattr(bar, 'metric_name', 'Unknown')
+                    value = getattr(bar, 'value', 0)
+                    
+                    # 跳过非最近月份或值为0的柱状图
+                    if month_num != latest_month or value == 0:
+                        continue
+                    
+                    # 只添加最近一个月的注释
+                    bar_annotations.append({
+                        'x': bar.get_x() + bar.get_width()/2,
+                        'y': bar.get_y() + bar.get_height(),
+                        'text': f"{dept_name}: {month_num}月 {metric_name} {value}",
+                        'metric': metric_name
+                    })
+                
+                # 为最近一个月份创建注释，避免重叠
+                for i, anno in enumerate(bar_annotations):
+                    y_offset = 10 + i * 18  # 垂直交错
+                    x_offset = 0
+                    
+                    # 判断是否需要使用连接线
+                    use_arrow = (len(bar_annotations) > 1)
+                    
+                    arrow_props = dict(arrowstyle="-", color="yellow", alpha=0.8) if use_arrow else None
+                    
+                    annotation = ax1.annotate(
+                        anno['text'],
+                        xy=(anno['x'], anno['y']),
+                        xytext=(x_offset, y_offset),
+                        textcoords="offset points",
+                        ha='center',
+                        bbox=dict(boxstyle="round,pad=0.3", fc="yellow", ec="b", alpha=0.8),
+                        color='black',
+                        fontsize=9,
+                        zorder=1000,
+                        arrowprops=arrow_props
+                    )
+                    temp_annotations.append(annotation)
+        
+        # 存储临时注释
+        self.temp_annotations = temp_annotations
+        
+        # 重绘图形
+        self.fig.canvas.draw_idle()
+
+    def _reset_all_line_styles(self):
+        """重置所有趋势线的样式"""
+        if not hasattr(self, 'fig') or not self.fig.axes:
+            return
+            
+        for line in self.fig.axes[0].get_lines():
+            if hasattr(line, 'original_color'):
+                line.set_color(line.original_color)
+                line.set_linewidth(line.original_linewidth)
+            elif hasattr(line, 'dept_name'):
+                dept_idx = list(self.data_processor.departments).index(line.dept_name) \
+                    if line.dept_name in self.data_processor.departments else 0
+                line.set_color(['#3a7ca5', '#d63031', '#00b894', '#fdcb6e'][dept_idx % 4])
+  
+    def _reset_all_bar_highlights(self):
+        """重置所有柱状图的高亮状态"""
+        if not hasattr(self, 'dept_bars'):
+            return
+            
+        # 恢复所有柱状图的原始透明度
+        for dept_bars in self.dept_bars.values():
+            for bar in dept_bars:
+                if hasattr(bar, 'is_highlighted') and bar.is_highlighted:
+                    bar.set_alpha(1.0)  # 恢复原始透明度
+                    bar.is_highlighted = False
+
+    def _highlight_department_bars(self, dept_name):
+        """高亮显示指定部门的所有柱状图"""
+        # 降低所有柱状图的透明度
+        for d_name, bars in self.dept_bars.items():
+            for bar in bars:
+                if d_name != dept_name:
+                    bar.set_alpha(0.3)  # 降低非目标部门的透明度
+                else:
+                    bar.set_alpha(1.0)  # 确保目标部门完全不透明
+                    bar.is_highlighted = True  # 标记为高亮状态
+
+    # Add method to prevent computer sleep based on platform
+    def prevent_sleep(self):
+        """Prevent computer from sleeping based on platform"""
+        while self.keep_awake_active:
+            # Move mouse slightly each minute to prevent sleep
+            if platform.system() == "Windows":
+                try:
+                    # On Windows, simulate keyboard input
+                    import ctypes
+                    ctypes.windll.kernel32.SetThreadExecutionState(0x80000002)  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+                except Exception as e:
+                    print(f"无法阻止系统休眠: {e}")
+            elif platform.system() == "Darwin":  # macOS
+                try:
+                    os.system("caffeinate -i -t 60 &")
+                except:
+                    pass
+            elif platform.system() == "Linux":
+                try:
+                    os.system("xdg-screensaver reset")
+                except:
+                    pass
+                
+            # 检查是否在允许显示的时间段内
+            if self.scheduled_display:
+                current_time = datetime.datetime.now().time()
+                start_time = datetime.time(hour=self.schedule_start_hour, minute=self.schedule_start_minute)
+                end_time = datetime.time(hour=self.schedule_end_hour, minute=self.schedule_end_minute)
+                
+                # 如果当前时间不在设定范围内，且高亮处于激活状态，则停止高亮
+                if not (start_time <= current_time <= end_time):
+                    if self.highlight_active:
+                        # 在tk主线程中停止高亮
+                        self.master.after(0, self.stop_highlight_cycle)
+                # 如果当前时间在设定范围内，且高亮未激活，则启动高亮
+                elif start_time <= current_time <= end_time:
+                    if not self.highlight_active:
+                        # 在tk主线程中启动高亮
+                        self.master.after(0, self.start_highlight_cycle)
+            
+            # 短暂休眠，避免过度占用CPU
+            time.sleep(30)  # 每30秒检查一次
+            
+    def toggle_keep_awake(self):
+        """Toggle keep awake functionality"""
+        self.keep_awake_active = not self.keep_awake_active
+        
+        if self.keep_awake_active:
+            self.keep_awake_btn.config(text="停止常显", bg="#e03131")
+            # Start thread to prevent sleep
+            self.keep_awake_thread = threading.Thread(target=self.prevent_sleep, daemon=True)
+            self.keep_awake_thread.start()
+        else:
+            self.keep_awake_btn.config(text="保持常显", bg="#37b24d")
+            # Thread will exit on its own when self.keep_awake_active becomes False
+            
+            # 如果定时显示也被关闭，则停止高亮循环
+            if self.scheduled_display and self.highlight_active:
+                self.stop_highlight_cycle()
+                
+    def toggle_scheduled_display(self):
+        """Toggle scheduled display functionality"""
+        self.scheduled_display = not self.scheduled_display
+        
+        if self.scheduled_display:
+            self.schedule_btn.config(text="取消定时", bg="#e03131")
+            # Start checking if we're in the scheduled time window
+            self.check_schedule()
+        else:
+            self.schedule_btn.config(text="定时显示", bg="#37b24d")
+            # If keep_awake is not active, stop the highlight cycle
+            if not self.keep_awake_active and self.highlight_active:
+                self.stop_highlight_cycle()
+    
+    def check_schedule(self):
+        """Check if current time is within scheduled display window"""
+        if not self.scheduled_display:
+            return
+            
+        current_time = datetime.datetime.now().time()
+        start_time = datetime.time(hour=self.schedule_start_hour, minute=self.schedule_start_minute)
+        end_time = datetime.time(hour=self.schedule_end_hour, minute=self.schedule_end_minute)
+        
+        # Update display based on current time
+        if start_time <= current_time <= end_time:
+            # Start highlight if not already active
+            if not self.highlight_active:
+                self.start_highlight_cycle()
+        else:
+            # Stop highlight if active
+            if self.highlight_active:
+                self.stop_highlight_cycle()
+        
+        # Schedule next check in 1 minute
+        self.schedule_check_timer = self.master.after(60000, self.check_schedule)
+        
+    def show_schedule_settings(self):
+        """Show a dialog to set the scheduled display time window"""
+        # Create toplevel window
+        settings_window = tk.Toplevel(self.master)
+        settings_window.title("设置显示时间段")
+        settings_window.geometry("350x200")
+        settings_window.configure(bg="#0a1a35")
+        settings_window.resizable(False, False)
+        settings_window.grab_set()  # Make it modal
+        
+        # Create frame for settings
+        settings_frame = tk.Frame(settings_window, bg="#0a1a35")
+        settings_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Start time settings
+        start_label = tk.Label(settings_frame, text="开始时间:", bg="#0a1a35", fg="white", font=("SimHei", 12))
+        start_label.grid(row=0, column=0, padx=5, pady=10, sticky="w")
+        
+        start_hour_var = tk.StringVar(value=str(self.schedule_start_hour))
+        start_hour = ttk.Spinbox(settings_frame, from_=0, to=23, width=3, textvariable=start_hour_var)
+        start_hour.grid(row=0, column=1, padx=5, pady=10)
+        
+        start_hour_label = tk.Label(settings_frame, text="时", bg="#0a1a35", fg="white", font=("SimHei", 12))
+        start_hour_label.grid(row=0, column=2, padx=2, pady=10)
+        
+        start_min_var = tk.StringVar(value=str(self.schedule_start_minute))
+        start_min = ttk.Spinbox(settings_frame, from_=0, to=59, width=3, textvariable=start_min_var)
+        start_min.grid(row=0, column=3, padx=5, pady=10)
+        
+        start_min_label = tk.Label(settings_frame, text="分", bg="#0a1a35", fg="white", font=("SimHei", 12))
+        start_min_label.grid(row=0, column=4, padx=2, pady=10)
+        
+        # End time settings
+        end_label = tk.Label(settings_frame, text="结束时间:", bg="#0a1a35", fg="white", font=("SimHei", 12))
+        end_label.grid(row=1, column=0, padx=5, pady=10, sticky="w")
+        
+        end_hour_var = tk.StringVar(value=str(self.schedule_end_hour))
+        end_hour = ttk.Spinbox(settings_frame, from_=0, to=23, width=3, textvariable=end_hour_var)
+        end_hour.grid(row=1, column=1, padx=5, pady=10)
+        
+        end_hour_label = tk.Label(settings_frame, text="时", bg="#0a1a35", fg="white", font=("SimHei", 12))
+        end_hour_label.grid(row=1, column=2, padx=2, pady=10)
+        
+        end_min_var = tk.StringVar(value=str(self.schedule_end_minute))
+        end_min = ttk.Spinbox(settings_frame, from_=0, to=59, width=3, textvariable=end_min_var)
+        end_min.grid(row=1, column=3, padx=5, pady=10)
+        
+        end_min_label = tk.Label(settings_frame, text="分", bg="#0a1a35", fg="white", font=("SimHei", 12))
+        end_min_label.grid(row=1, column=4, padx=2, pady=10)
+        
+        # Function to save settings
+        def save_settings():
+            try:
+                # Parse values
+                start_h = int(start_hour_var.get())
+                start_m = int(start_min_var.get())
+                end_h = int(end_hour_var.get())
+                end_m = int(end_min_var.get())
+                
+                # Validate ranges
+                if 0 <= start_h <= 23 and 0 <= start_m <= 59 and 0 <= end_h <= 23 and 0 <= end_m <= 59:
+                    # Save settings
+                    self.schedule_start_hour = start_h
+                    self.schedule_start_minute = start_m
+                    self.schedule_end_hour = end_h
+                    self.schedule_end_minute = end_m
+                    
+                    # If scheduled display is active, immediately check the schedule
+                    if self.scheduled_display:
+                        self.check_schedule()
+                    
+                    settings_window.destroy()
+                else:
+                    messagebox.showerror("错误", "请输入有效的时间范围（小时：0-23，分钟：0-59）")
+            except ValueError:
+                messagebox.showerror("错误", "请输入有效的整数时间值")
+        
+        # Save button
+        save_btn = tk.Button(settings_frame, text="保存设置", 
+                            command=save_settings,
+                            bg="#4a89dc", fg="white", 
+                            font=("SimHei", 12))
+        save_btn.grid(row=2, column=0, columnspan=5, pady=20)
 
 def main():
     root = tk.Tk()
     app = ProjectDashboard(root)
+    
+    # Add window close handler to clean up resources
+    def on_closing():
+        if app.keep_awake_active:
+            app.keep_awake_active = False  # Stop the keep-awake thread
+        
+        if app.highlight_timer:
+            root.after_cancel(app.highlight_timer)  # Cancel highlight timer
+            
+        if app.schedule_check_timer:
+            root.after_cancel(app.schedule_check_timer)  # Cancel schedule check timer
+            
+        root.destroy()
+        
+    root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
 
 if __name__ == "__main__":
